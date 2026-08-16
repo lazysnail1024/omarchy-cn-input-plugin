@@ -1,0 +1,472 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+readonly FCITX_SERVICE="org.fcitx.Fcitx5"
+readonly FCITX_PATH="/controller"
+readonly FCITX_INTERFACE="org.fcitx.Fcitx.Controller1"
+
+readonly FCITX_REMOTE="${CN_INPUT_FCITX_REMOTE:-fcitx5-remote}"
+readonly BUSCTL="${CN_INPUT_BUSCTL:-busctl}"
+readonly PACMAN="${CN_INPUT_PACMAN:-pacman}"
+readonly RIME_DEPLOYER="${CN_INPUT_RIME_DEPLOYER:-rime_deployer}"
+readonly RIME_SHARED_DIR="${CN_INPUT_RIME_SHARED_DIR:-/usr/share/rime-data}"
+
+readonly CONFIG_HOME="${XDG_CONFIG_HOME:-${HOME}/.config}"
+readonly DATA_HOME="${XDG_DATA_HOME:-${HOME}/.local/share}"
+readonly STATE_HOME="${XDG_STATE_HOME:-${HOME}/.local/state}"
+readonly FCITX_CONFIG="${CONFIG_HOME}/fcitx5/config"
+readonly RIME_DIR="${DATA_HOME}/fcitx5/rime"
+readonly RIME_CUSTOM="${RIME_DIR}/default.custom.yaml"
+readonly BACKUP_DIR="${STATE_HOME}/community.cn-input/backups"
+
+die() {
+  printf 'Chinese Input: %s\n' "$*" >&2
+  exit 1
+}
+
+require_command() {
+  command -v "$1" >/dev/null 2>&1 || die "Required command not found: $1"
+}
+
+package_present() {
+  "$PACMAN" -Q "$1" >/dev/null 2>&1
+}
+
+rime_addon_present() {
+  [[ -f /usr/lib/fcitx5/librime.so ]] || package_present fcitx5-rime
+}
+
+rime_data_present() {
+  [[ -f "${RIME_SHARED_DIR}/rime_ice.schema.yaml" ]] ||
+    package_present rime-ice-pinyin-git ||
+    package_present rime-ice-git ||
+    return 1
+}
+
+fcitx_running() {
+  "$FCITX_REMOTE" --check >/dev/null 2>&1
+}
+
+fcitx_state() {
+  local value
+  value="$({ "$FCITX_REMOTE"; } 2>/dev/null || true)"
+  case "$value" in
+    0|1|2) printf '%s\n' "$value" ;;
+    *) printf '0\n' ;;
+  esac
+}
+
+current_input_method() {
+  "$FCITX_REMOTE" -n 2>/dev/null || true
+}
+
+controller_call() {
+  "$BUSCTL" --user call "$FCITX_SERVICE" "$FCITX_PATH" "$FCITX_INTERFACE" "$@"
+}
+
+controller_json() {
+  "$BUSCTL" --user --json=short call \
+    "$FCITX_SERVICE" "$FCITX_PATH" "$FCITX_INTERFACE" "$@"
+}
+
+current_group() {
+  controller_json CurrentInputMethodGroup | jq -er '.data[0]'
+}
+
+group_info() {
+  controller_json InputMethodGroupInfo s "$1"
+}
+
+group_has_rime() {
+  local group info
+  group="$(current_group 2>/dev/null)" || return 1
+  info="$(group_info "$group" 2>/dev/null)" || return 1
+  jq -e '.data[1] | any(.[0] == "rime")' >/dev/null <<<"$info"
+}
+
+read_ini_value() {
+  local file="$1" section="$2" key="$3"
+  [[ -f "$file" ]] || return 1
+  awk -v wanted_section="$section" -v wanted_key="$key" '
+    /^\[[^]]+\][[:space:]]*$/ {
+      current = $0
+      sub(/^\[/, "", current)
+      sub(/\][[:space:]]*$/, "", current)
+      in_section = (current == wanted_section)
+      next
+    }
+    in_section {
+      line = $0
+      sub(/^[[:space:]]*/, "", line)
+      split(line, parts, "=")
+      candidate = parts[1]
+      sub(/[[:space:]]*$/, "", candidate)
+      if (candidate == wanted_key) {
+        sub(/^[^=]*=[[:space:]]*/, "", line)
+        print line
+        found = 1
+        exit
+      }
+    }
+    END { if (!found) exit 1 }
+  ' "$file"
+}
+
+ini_section_exists() {
+  local file="$1" section="$2"
+  [[ -f "$file" ]] && grep -Fqx "[$section]" "$file"
+}
+
+backup_file() {
+  local file="$1" label timestamp target
+  [[ -f "$file" ]] || return 0
+  mkdir -p "$BACKUP_DIR"
+  label="${file##*/}"
+  timestamp="$(date +%Y%m%d-%H%M%S-%N)"
+  target="${BACKUP_DIR}/${label}.${timestamp}.bak"
+  cp -p -- "$file" "$target"
+}
+
+replace_atomically() {
+  local file="$1" temporary="$2"
+  if [[ -f "$file" ]]; then
+    chmod --reference="$file" "$temporary" 2>/dev/null || true
+  else
+    chmod 600 "$temporary"
+  fi
+  mv -f -- "$temporary" "$file"
+}
+
+set_ini_value() {
+  local file="$1" section="$2" key="$3" value="$4" temporary source
+  mkdir -p "$(dirname "$file")"
+  temporary="$(mktemp "${file}.tmp.XXXXXX")"
+  source=/dev/null
+  [[ -f "$file" ]] && source="$file"
+
+  awk -v wanted_section="$section" -v wanted_key="$key" -v wanted_value="$value" '
+    function print_value() {
+      if (!wrote_value) {
+        print wanted_key "=" wanted_value
+        wrote_value = 1
+      }
+    }
+    /^\[[^]]+\][[:space:]]*$/ {
+      if (in_section) print_value()
+      current = $0
+      sub(/^\[/, "", current)
+      sub(/\][[:space:]]*$/, "", current)
+      in_section = (current == wanted_section)
+      if (in_section) found_section = 1
+      print
+      next
+    }
+    {
+      if (in_section) {
+        line = $0
+        sub(/^[[:space:]]*/, "", line)
+        split(line, parts, "=")
+        candidate = parts[1]
+        sub(/[[:space:]]*$/, "", candidate)
+        if (candidate == wanted_key) {
+          print_value()
+          next
+        }
+      }
+      print
+    }
+    END {
+      if (in_section) print_value()
+      if (!found_section) {
+        if (NR > 0) print ""
+        print "[" wanted_section "]"
+        print_value()
+      }
+    }
+  ' "$source" >"$temporary"
+
+  replace_atomically "$file" "$temporary"
+}
+
+startup_language() {
+  local value
+  value="$(read_ini_value "$FCITX_CONFIG" Behavior ActiveByDefault 2>/dev/null || true)"
+  case "${value,,}" in
+    true|yes|1|on) printf 'cn\n' ;;
+    *) printf 'en\n' ;;
+  esac
+}
+
+status_command() {
+  require_command jq
+
+  local addon=false data=false running=false configured=false ready=false
+  local mode="unknown" message startup state im
+
+  if rime_addon_present; then addon=true; fi
+  if rime_data_present; then data=true; fi
+  if fcitx_running; then running=true; fi
+  if [[ "$running" == true ]] && group_has_rime; then configured=true; fi
+
+  if [[ "$running" == true ]]; then
+    state="$(fcitx_state)"
+    im="$(current_input_method)"
+    if [[ "$state" == 2 && "$im" == rime ]]; then mode=cn; else mode=en; fi
+  fi
+
+  if [[ "$addon" != true ]]; then
+    message="Fcitx5 Rime is not installed"
+  elif [[ "$data" != true ]]; then
+    message="Rime Ice full pinyin is not installed"
+  elif [[ "$running" != true ]]; then
+    message="Fcitx5 is not running"
+  elif [[ "$configured" != true ]]; then
+    message="Rime is not enabled in the current input-method group"
+  else
+    ready=true
+    message="Ready"
+  fi
+
+  startup="$(startup_language)"
+  jq -cn \
+    --argjson ready "$ready" \
+    --arg mode "$mode" \
+    --arg startupLanguage "$startup" \
+    --argjson fcitxRunning "$running" \
+    --argjson rimeAddonInstalled "$addon" \
+    --argjson rimeDataInstalled "$data" \
+    --argjson rimeConfigured "$configured" \
+    --arg message "$message" \
+    '{ready: $ready, mode: $mode, startupLanguage: $startupLanguage,
+      fcitxRunning: $fcitxRunning, rimeAddonInstalled: $rimeAddonInstalled,
+      rimeDataInstalled: $rimeDataInstalled, rimeConfigured: $rimeConfigured,
+      message: $message}'
+}
+
+require_ready_input() {
+  fcitx_running || die "Fcitx5 is not running. Open the settings panel and run setup."
+  rime_addon_present || die "Fcitx5 Rime is not installed. Open the settings panel and run setup."
+  rime_data_present || die "Rime Ice is not installed. Open the settings panel and run setup."
+  group_has_rime || die "Rime is not configured. Open the settings panel and run setup."
+}
+
+apply_mode() {
+  local language="$1"
+  if [[ "$language" == cn ]]; then
+    "$FCITX_REMOTE" -s rime >/dev/null
+    "$FCITX_REMOTE" -o >/dev/null
+  else
+    "$FCITX_REMOTE" -c >/dev/null
+  fi
+}
+
+set_mode_command() {
+  local language="${1:-}"
+  [[ "$language" == en || "$language" == cn ]] || die "Expected language 'en' or 'cn'."
+  require_ready_input
+  apply_mode "$language"
+}
+
+toggle_command() {
+  require_ready_input
+  if [[ "$(fcitx_state)" == 2 && "$(current_input_method)" == rime ]]; then
+    apply_mode en
+  else
+    apply_mode cn
+  fi
+}
+
+set_startup_command() {
+  local language="${1:-}" value=False
+  [[ "$language" == en || "$language" == cn ]] || die "Expected language 'en' or 'cn'."
+  [[ "$language" == cn ]] && value=True
+
+  backup_file "$FCITX_CONFIG"
+  set_ini_value "$FCITX_CONFIG" Behavior ActiveByDefault "$value"
+
+  if fcitx_running; then
+    controller_call ReloadConfig >/dev/null ||
+      die "The setting was saved, but Fcitx5 could not reload it."
+  fi
+}
+
+ensure_ctrl_space() {
+  local next_key=0 value
+  ini_section_exists "$FCITX_CONFIG" Hotkey/TriggerKeys || return 0
+
+  while IFS= read -r value; do
+    if [[ "${value,,}" == "control+space" || "${value,,}" == "ctrl+space" ]]; then
+      return 0
+    fi
+  done < <(awk '
+    /^\[Hotkey\/TriggerKeys\][[:space:]]*$/ { active = 1; next }
+    /^\[[^]]+\][[:space:]]*$/ { active = 0 }
+    active && /^[[:space:]]*[0-9]+[[:space:]]*=/ {
+      line = $0
+      sub(/^[^=]*=[[:space:]]*/, "", line)
+      print line
+    }
+  ' "$FCITX_CONFIG")
+
+  while read -r value; do
+    (( value >= next_key )) && next_key=$((value + 1))
+  done < <(awk '
+    /^\[Hotkey\/TriggerKeys\][[:space:]]*$/ { active = 1; next }
+    /^\[[^]]+\][[:space:]]*$/ { active = 0 }
+    active && /^[[:space:]]*[0-9]+[[:space:]]*=/ {
+      line = $0
+      sub(/^[[:space:]]*/, "", line)
+      sub(/[[:space:]]*=.*$/, "", line)
+      print line
+    }
+  ' "$FCITX_CONFIG")
+
+  backup_file "$FCITX_CONFIG"
+  set_ini_value "$FCITX_CONFIG" Hotkey/TriggerKeys "$next_key" Control+space
+}
+
+configure_rime_custom() {
+  local temporary
+  mkdir -p "$RIME_DIR"
+
+  if [[ ! -f "$RIME_CUSTOM" ]]; then
+    temporary="$(mktemp "${RIME_CUSTOM}.tmp.XXXXXX")"
+    printf '%s\n' \
+      '# Managed addition from community.cn-input; other Rime settings may be added here.' \
+      'patch:' \
+      '  schema_list:' \
+      '    - schema: rime_ice' >"$temporary"
+    replace_atomically "$RIME_CUSTOM" "$temporary"
+    return 0
+  fi
+
+  if grep -Eq '^[[:space:]]*-[[:space:]]*schema:[[:space:]]*rime_ice([[:space:]]|$)' "$RIME_CUSTOM"; then
+    return 0
+  fi
+
+  if grep -Eq '^patch:[[:space:]]*$' "$RIME_CUSTOM"; then
+    backup_file "$RIME_CUSTOM"
+    temporary="$(mktemp "${RIME_CUSTOM}.tmp.XXXXXX")"
+    awk '
+      function insert_schema() {
+        print "  # Added by community.cn-input"
+        print "  schema_list/+:"
+        print "    - schema: rime_ice"
+        inserted = 1
+      }
+      /^patch:[[:space:]]*$/ && !found_patch {
+        print
+        found_patch = 1
+        in_patch = 1
+        next
+      }
+      in_patch && /^[^[:space:]#]/ {
+        insert_schema()
+        in_patch = 0
+      }
+      { print }
+      END { if (in_patch && !inserted) insert_schema() }
+    ' "$RIME_CUSTOM" >"$temporary"
+    replace_atomically "$RIME_CUSTOM" "$temporary"
+    return 0
+  fi
+
+  if grep -Eq '^patch:' "$RIME_CUSTOM"; then
+    die "${RIME_CUSTOM} uses an inline or tagged patch value. Add '- schema: rime_ice' manually; the file was not changed."
+  fi
+
+  backup_file "$RIME_CUSTOM"
+  temporary="$(mktemp "${RIME_CUSTOM}.tmp.XXXXXX")"
+  awk '{ print } END {
+    if (NR > 0) print ""
+    print "patch:"
+    print "  # Added by community.cn-input"
+    print "  schema_list/+:"
+    print "    - schema: rime_ice"
+  }' "$RIME_CUSTOM" >"$temporary"
+  replace_atomically "$RIME_CUSTOM" "$temporary"
+}
+
+configure_group() {
+  local old_state old_input_method group info layout count row input_method layout_override
+  local -a arguments
+
+  old_state="$(fcitx_state)"
+  old_input_method="$(current_input_method)"
+  group="$(current_group)" || die "Could not read the current Fcitx5 input-method group."
+  info="$(group_info "$group")" || die "Could not read Fcitx5 input methods."
+
+  if ! jq -e '.data[1] | any(.[0] == "rime")' >/dev/null <<<"$info"; then
+    layout="$(jq -er '.data[0]' <<<"$info")"
+    count="$(jq -er '.data[1] | length + 1' <<<"$info")"
+    arguments=(SetInputMethodGroupInfo 'ssa(ss)' "$group" "$layout" "$count")
+
+    while IFS= read -r row; do
+      input_method="$(base64 -d <<<"$row" | jq -r '.[0]')"
+      layout_override="$(base64 -d <<<"$row" | jq -r '.[1]')"
+      arguments+=("$input_method" "$layout_override")
+    done < <(jq -r '.data[1][] | @base64' <<<"$info")
+    arguments+=(rime '')
+    controller_call "${arguments[@]}" >/dev/null
+  fi
+
+  "$FCITX_REMOTE" -s rime >/dev/null
+  controller_call Save >/dev/null
+
+  if [[ "$old_state" == 2 ]]; then
+    if [[ -n "$old_input_method" && "$old_input_method" != rime ]]; then
+      "$FCITX_REMOTE" -s "$old_input_method" >/dev/null
+    fi
+    "$FCITX_REMOTE" -o >/dev/null
+  else
+    "$FCITX_REMOTE" -c >/dev/null
+  fi
+}
+
+configure_command() {
+  require_command jq
+  require_command "$FCITX_REMOTE"
+  require_command "$BUSCTL"
+  require_command "$RIME_DEPLOYER"
+  rime_addon_present || die "Install fcitx5-rime first."
+  rime_data_present || die "Install rime-ice-pinyin-git first."
+  fcitx_running || die "Fcitx5 is not running."
+
+  configure_rime_custom
+  "$RIME_DEPLOYER" --build "$RIME_DIR" "$RIME_SHARED_DIR" "${RIME_DIR}/build"
+
+  if [[ -f "$FCITX_CONFIG" ]]; then
+    ensure_ctrl_space
+  fi
+  if ! read_ini_value "$FCITX_CONFIG" Behavior ActiveByDefault >/dev/null 2>&1; then
+    backup_file "$FCITX_CONFIG"
+    set_ini_value "$FCITX_CONFIG" Behavior ActiveByDefault False
+  fi
+
+  configure_group
+  controller_call ReloadConfig >/dev/null
+}
+
+usage() {
+  cat <<'USAGE'
+Usage: cn-inputctl COMMAND [ARG]
+
+Commands:
+  status                 Print widget status as JSON
+  toggle                 Toggle English and Chinese for the focused app
+  set-mode en|cn         Select English or Chinese for the focused app
+  set-startup en|cn      Select the input state used for new apps after login
+  configure              Safely configure Rime Ice and the Fcitx5 group
+USAGE
+}
+
+case "${1:-}" in
+  status) status_command ;;
+  toggle) toggle_command ;;
+  set-mode) set_mode_command "${2:-}" ;;
+  set-startup) set_startup_command "${2:-}" ;;
+  configure) configure_command ;;
+  -h|--help|help) usage ;;
+  *) usage >&2; exit 2 ;;
+esac

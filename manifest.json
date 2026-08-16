@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "community.cn-input",
+  "name": "Chinese Input",
+  "version": "1.1.0",
+  "author": "Community contributors",
+  "license": "MIT",
+  "description": "English and Chinese Fcitx5/Rime status, switching, and startup settings for the Omarchy bar.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Chinese Input",
+    "description": "Show and switch English/Chinese input, with startup defaults and guided Rime Ice setup.",
+    "category": "Input",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

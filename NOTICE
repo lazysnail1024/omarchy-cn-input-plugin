@@ -1,0 +1,29 @@
+Attribution Notice
+==================
+
+This repository is a modified version of:
+
+  Chinese Input for Omarchy
+  https://github.com/gohlihan/omarchy-cn-input-plugin
+
+The upstream project is licensed under the MIT License. The upstream MIT
+license text and copyright notice are preserved in this repository's LICENSE
+file.
+
+Modifications in this repository
+--------------------------------
+
+The refactor keeps the existing user-facing behavior while simplifying the
+frontend state model:
+
+- BarWidget.qml is the single frontend owner of backend status.
+- Panel.qml consumes that status instead of running its own status process.
+- Startup-language changes no longer use optimistic frontend state; the UI
+  re-reads the backend source of truth after a successful mutation.
+- The existing one-second reconciliation polling is intentionally retained for
+  simplicity and self-healing behavior.
+- Safety-critical Bash behavior from upstream is retained, including backups,
+  atomic file replacement, idempotent configuration, and refusal to rewrite
+  ambiguous Rime YAML.
+
+No endorsement by the upstream author is implied.

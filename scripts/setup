@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+readonly SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+readonly CONTROL="${SCRIPT_DIR}/cn-inputctl"
+readonly PACMAN="${CN_INPUT_PACMAN:-pacman}"
+readonly OMARCHY="${CN_INPUT_OMARCHY:-omarchy}"
+readonly YAY="${CN_INPUT_YAY:-yay}"
+readonly SYSTEMCTL="${CN_INPUT_SYSTEMCTL:-systemctl}"
+readonly FCITX_REMOTE="${CN_INPUT_FCITX_REMOTE:-fcitx5-remote}"
+
+pause_on_exit=false
+if [[ "${1:-}" == --from-ui ]]; then
+  pause_on_exit=true
+fi
+
+finish() {
+  local exit_code=$?
+  if [[ "$pause_on_exit" == true && -t 0 ]]; then
+    printf '\nPress Enter to close…'
+    read -r _ || true
+  fi
+  exit "$exit_code"
+}
+trap finish EXIT
+
+die() {
+  printf '\nError: %s\n' "$*" >&2
+  exit 1
+}
+
+have_package() {
+  "$PACMAN" -Q "$1" >/dev/null 2>&1
+}
+
+printf '\nChinese Input for Omarchy\n'
+printf '==========================\n\n'
+
+command -v "$OMARCHY" >/dev/null 2>&1 || die "Omarchy was not found."
+command -v "$YAY" >/dev/null 2>&1 || die "yay was not found."
+command -v jq >/dev/null 2>&1 || die "jq was not found."
+
+omarchy_version="$("$OMARCHY" version 2>/dev/null || true)"
+omarchy_major="${omarchy_version%%.*}"
+[[ "$omarchy_major" =~ ^[0-9]+$ ]] || die "Could not determine the Omarchy version."
+(( omarchy_major >= 4 )) || die "This plugin requires Omarchy 4 or newer."
+
+printf '[1/4] Installing the Fcitx5 Rime engine…\n'
+"$OMARCHY" pkg add fcitx5-rime
+
+printf '\n[2/4] Installing Rime Ice full pinyin…\n'
+if ! have_package rime-ice-pinyin-git && ! have_package rime-ice-git; then
+  "$YAY" -S --needed rime-ice-pinyin-git
+else
+  printf 'Rime Ice is already installed.\n'
+fi
+
+printf '\n[3/4] Starting the Omarchy Fcitx5 service…\n'
+"$SYSTEMCTL" --user restart omarchy-fcitx5.service
+for _ in {1..20}; do
+  if "$FCITX_REMOTE" --check >/dev/null 2>&1; then
+    break
+  fi
+  sleep 0.25
+done
+"$FCITX_REMOTE" --check >/dev/null 2>&1 || die "Fcitx5 did not become ready. Try logging out and back in."
+
+printf '\n[4/4] Enabling Rime Ice without replacing your existing settings…\n'
+"$CONTROL" configure
+
+printf '\nSetup complete. Left click “en”/“cn” or press Ctrl+Space to switch.\n'
+printf 'Right click the bar label to choose the startup language.\n\n'
+"$CONTROL" status | jq .
