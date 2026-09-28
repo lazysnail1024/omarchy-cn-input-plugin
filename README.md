@@ -13,7 +13,7 @@ The main refactor is architectural rather than functional:
 - `BarWidget.qml` is the only frontend owner of backend status.
 - `Panel.qml` no longer starts its own `status` process.
 - The panel no longer keeps an optimistic copy of `startupLanguage`; after a mutation it re-reads the backend state.
-- The existing 1-second polling remains intentionally: it is simple, self-healing, and cheap for this plugin.
+- D-Bus input-method events and Hyprland focus events request a refresh; one-second polling covers missed events and Rime submode changes.
 - Safety-critical Bash behavior remains intact: backups, atomic file replacement, idempotent configuration, and refusal to rewrite ambiguous Rime YAML.
 
 The resulting data flow is:
@@ -49,6 +49,8 @@ It then enables the Rime Ice full-pinyin schema and appends Rime to the current 
 ## Behavior
 
 - The bar shows `en` or `cn`.
+- When available, the Rime D-Bus `IsAsciiMode` API distinguishes Chinese from Rime's internal ASCII mode. Older versions without this API show `Rime` instead of guessing; unavailable contexts show `--`.
+- Status display and switching do not require the Rime Ice package when Rime is already available. `ready` describes guided-setup readiness, while `canSwitch` describes the running input-method group.
 - Left click, or `Ctrl+Space`, switches the focused app.
 - Right click opens startup settings for new input contexts.
 - Setup and repair run in a terminal so package confirmation and password prompts remain visible.
@@ -91,9 +93,13 @@ omarchy plugin validate .
 qmllint -I /usr/share/omarchy/shell BarWidget.qml Panel.qml
 ```
 
-## Design choice: polling stays
+## Status refresh
 
-This version deliberately does **not** add a long-running DBus watcher. A one-second reconciliation loop means a failed query repairs itself on the next tick and avoids lifecycle, reconnection, and missed-signal handling. For a small input-method widget, that simplicity is worth more than eliminating a small amount of polling.
+Requires `dbus-monitor` for event-driven refresh. The monitor reconnects after exit; one-second polling remains available if monitoring fails. The bar owns all status queries, coalesces requests during a running query, and refreshes after its panel releases focus. Rime ASCII changes are detected by querying the actual state, not by counting Shift presses. Hotkey configuration is independent of the widget.
+
+Selecting Chinese also clears Rime ASCII mode when the API is available. English explicitly selects `keyboard-us`. Input-method IDs determine the mode: Fcitx activation alone is insufficient when Rime is the first group entry. Startup settings still control Fcitx activation, not Rime's internal ASCII default or a guaranteed language for arbitrary group order.
+
+The event/focus refresh design was informed by [omarchy-fctix-status](https://github.com/manateelazycat/omarchy-fctix-status); its source is GPL-3.0-only. This project implements the behavior independently.
 
 ## Upstream and attribution
 

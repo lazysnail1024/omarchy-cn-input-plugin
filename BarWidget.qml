@@ -1,12 +1,14 @@
 import QtQuick
 import Quickshell
 import Quickshell.Io
+import Quickshell.Hyprland
 import qs.Commons
 import qs.Ui
 
 BarWidget {
   id: root
   moduleName: "community.cn-input"
+  property bool refreshPending: false
 
   // BarWidget is the single owner of backend status for this widget instance.
   // Panel.qml only consumes this state and asks the host to refresh it.
@@ -18,9 +20,8 @@ BarWidget {
   })
 
   readonly property string controlPath: root.localPath(Qt.resolvedUrl("scripts/cn-inputctl"))
-  readonly property string label: status.ready === true
-    ? (status.mode === "cn" ? "cn" : "en")
-    : "--"
+  readonly property string label: status.mode === "cn" ? "cn"
+    : status.mode === "en" ? "en" : status.mode === "rime" ? "Rime" : "--"
   readonly property bool opened: panelLoader.item ? panelLoader.item.opened === true : false
   readonly property bool popoutSwitchClosing: panelLoader.item
     ? panelLoader.item.popoutSwitchClosing === true
@@ -33,15 +34,23 @@ BarWidget {
   }
 
   function applyStatus(value) {
+    // A query started before the panel opened can finish after focus moved.
+    if (root.opened) return
     if (value && typeof value === "object") root.status = value
   }
 
   function refreshStatus() {
-    if (!statusProc.running) statusProc.running = true
+    if (root.opened) return
+    if (statusProc.running) {
+      root.refreshPending = true
+      return
+    }
+    root.refreshPending = false
+    statusProc.running = true
   }
 
   function toggleLanguage() {
-    if (root.status.ready !== true) {
+    if (root.status.canSwitch !== true) {
       root.open()
       return
     }
@@ -79,6 +88,7 @@ BarWidget {
 
   onBarChanged: injectPanel()
   onSettingsChanged: injectPanel()
+  onOpenedChanged: if (!opened) refreshDelay.restart()
   Component.onCompleted: refreshStatus()
 
   Loader {
@@ -95,6 +105,7 @@ BarWidget {
   Process {
     id: statusProc
     command: [root.controlPath, "status"]
+    onExited: if (root.refreshPending) refreshDelay.restart()
 
     stdout: StdioCollector {
       waitForEnd: true
@@ -110,6 +121,43 @@ BarWidget {
           })
         }
       }
+    }
+  }
+
+  // Events reduce latency; polling still covers Rime submode changes and
+  // frontends that do not emit CurrentIM. No keystroke inference is used.
+  Process {
+    id: monitor
+    running: true
+    command: ["dbus-monitor", "--session", "--profile",
+      "type='signal',interface='org.fcitx.Fcitx.InputContext1',member='CurrentIM'",
+      "type='signal',interface='org.freedesktop.DBus',member='NameOwnerChanged',arg0='org.fcitx.Fcitx5'"]
+    stdout: SplitParser {
+      onRead: function(line) {
+        if (line.indexOf("CurrentIM") !== -1 || line.indexOf("NameOwnerChanged") !== -1)
+          refreshDelay.restart()
+      }
+    }
+    onExited: monitorRetry.restart()
+  }
+
+  Timer {
+    id: monitorRetry
+    interval: 5000
+    onTriggered: monitor.running = true
+  }
+
+  Timer {
+    id: refreshDelay
+    interval: 60
+    onTriggered: root.refreshStatus()
+  }
+
+  Connections {
+    target: Hyprland
+    function onRawEvent(event) {
+      if (event && ["activewindow", "activewindowv2", "focusedmon", "focusedmonv2"].indexOf(event.name) !== -1)
+        refreshDelay.restart()
     }
   }
 
@@ -135,6 +183,7 @@ BarWidget {
     target: "community.cn-input"
 
     function refresh(): void { root.refreshStatus() }
+    function current(): string { return JSON.stringify(root.status) }
     function toggle(): void { root.toggleLanguage() }
     function open(): void { root.open() }
     function close(): void { root.close() }
@@ -150,8 +199,8 @@ BarWidget {
     fontSize: Style.font.caption
     horizontalMargin: 6
     useActiveColor: false
-    tooltipText: root.status.ready === true
-      ? (root.status.mode === "cn" ? "Chinese input" : "English input")
+    tooltipText: root.status.mode !== "unknown" && root.status.mode !== undefined
+      ? (root.status.mode === "cn" ? "Chinese input" : root.status.mode === "en" ? "English input" : "Input mode unavailable")
         + "\nLeft click or Ctrl+Space to switch"
         + "\nRight click for startup settings"
       : String(root.status.message || "Setup required")

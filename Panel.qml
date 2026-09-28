@@ -153,7 +153,7 @@ Panel {
         Text {
           width: parent.width
           text: root.status.ready === true
-            ? "Current input: " + (root.status.mode === "cn" ? "Chinese" : "English")
+            ? "Current input: " + (root.status.mode === "cn" ? "Chinese" : root.status.mode === "en" ? "English" : root.status.mode === "rime" ? "Rime (mode unavailable)" : "Unknown")
             : String(root.status.message || "Setup required")
           color: root.status.ready === true ? root.dimForeground : root.urgent
           font.family: root.fontFamily

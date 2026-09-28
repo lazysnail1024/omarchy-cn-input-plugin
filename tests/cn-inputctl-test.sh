@@ -44,6 +44,10 @@ cat >"${mock_bin}/busctl" <<'MOCK'
 #!/usr/bin/env bash
 printf 'busctl %s\n' "$*" >>"$MOCK_LOG"
 case " $* " in
+  *' IsAsciiMode '*)
+    [[ "${MOCK_ASCII:-false}" != unavailable ]] || exit 1
+    printf '{"type":"b","data":[%s]}\n' "${MOCK_ASCII:-false}"
+    ;;
   *' CurrentInputMethodGroup '*)
     printf '%s\n' '{"type":"s","data":["Default"]}'
     ;;
@@ -144,9 +148,23 @@ assert_equal cn "$(jq -r .mode <<<"$status_json")" "status reports active Rime a
 assert_equal cn "$(jq -r .startupLanguage <<<"$status_json")" "status reads the startup preference"
 pass "status exposes ready, current, and startup state"
 
+assert_equal en "$(MOCK_ASCII=true "$CONTROL" status | jq -r .mode)" "Rime ASCII mode should be English"
+assert_equal cn "$(MOCK_STATE=1 "$CONTROL" status | jq -r .mode)" "Rime first in group must not be mistaken for English"
+assert_equal rime "$(MOCK_ASCII=unavailable "$CONTROL" status | jq -r .mode)" "missing Rime API should not claim Chinese"
+assert_equal rime "$(MOCK_ASCII='"false"' "$CONTROL" status | jq -r .mode)" "non-boolean Rime response should be unknown"
+assert_equal unknown "$(MOCK_STATE=0 "$CONTROL" status | jq -r .mode)" "no input context should not be English"
+assert_equal unknown "$(MOCK_IM=mozc "$CONTROL" status | jq -r .mode)" "other active IM should not be English"
+pass "status distinguishes Rime ASCII, unavailable submode, and unknown contexts"
+
+: >"$mock_log"
+MOCK_ASCII=true "$CONTROL" toggle
+assert_file_contains "$mock_log" 'SetAsciiMode b false' "toggle from Rime ASCII must select Chinese"
+assert_file_not_contains "$mock_log" 'fcitx5-remote -c' "toggle from Rime ASCII must not deactivate Rime"
+pass "toggle from Rime ASCII selects Chinese instead of deactivating"
+
 : >"$mock_log"
 "$CONTROL" toggle
-assert_file_contains "$mock_log" 'fcitx5-remote -c' "toggle did not close active Rime"
+assert_file_contains "$mock_log" 'fcitx5-remote -s keyboard-us' "toggle did not select the English keyboard"
 pass "toggle changes active Chinese input to English"
 
 : >"$mock_log"

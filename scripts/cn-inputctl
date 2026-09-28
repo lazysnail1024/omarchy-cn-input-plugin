@@ -70,6 +70,12 @@ controller_json() {
     "$FCITX_SERVICE" "$FCITX_PATH" "$FCITX_INTERFACE" "$@"
 }
 
+rime_ascii_mode() {
+  "$BUSCTL" --user --timeout=2s --json=short call "$FCITX_SERVICE" /rime \
+    org.fcitx.Fcitx.Rime1 IsAsciiMode 2>/dev/null |
+    jq -er 'if .type == "b" and (.data[0] | type) == "boolean" then .data[0] | tostring else error("Invalid ASCII state") end' 2>/dev/null
+}
+
 current_group() {
   controller_json CurrentInputMethodGroup | jq -er '.data[0]'
 }
@@ -202,7 +208,7 @@ status_command() {
   require_command jq
 
   local addon=false data=false running=false configured=false ready=false
-  local mode="unknown" message startup state im
+  local mode="unknown" message startup state=0 im="" ascii=null
 
   if rime_addon_present; then addon=true; fi
   if rime_data_present; then data=true; fi
@@ -212,7 +218,16 @@ status_command() {
   if [[ "$running" == true ]]; then
     state="$(fcitx_state)"
     im="$(current_input_method)"
-    if [[ "$state" == 2 && "$im" == rime ]]; then mode=cn; else mode=en; fi
+    if [[ "$state" != 0 && "$im" == rime ]]; then
+      ascii="$(rime_ascii_mode)" || ascii=null
+      case "$ascii" in
+        true) mode=en ;;
+        false) mode=cn ;;
+        *) mode=rime ;;
+      esac
+    elif [[ "$state" != 0 && "$im" == keyboard-* ]]; then
+      mode=en
+    fi
   fi
 
   if [[ "$addon" != true ]]; then
@@ -233,12 +248,17 @@ status_command() {
     --argjson ready "$ready" \
     --arg mode "$mode" \
     --arg startupLanguage "$startup" \
+    --argjson state "$state" \
+    --arg inputMethod "$im" \
+    --argjson asciiMode "$ascii" \
+    --argjson canSwitch "$configured" \
     --argjson fcitxRunning "$running" \
     --argjson rimeAddonInstalled "$addon" \
     --argjson rimeDataInstalled "$data" \
     --argjson rimeConfigured "$configured" \
     --arg message "$message" \
     '{ready: $ready, mode: $mode, startupLanguage: $startupLanguage,
+      state: $state, inputMethod: $inputMethod, asciiMode: $asciiMode, canSwitch: $canSwitch,
       fcitxRunning: $fcitxRunning, rimeAddonInstalled: $rimeAddonInstalled,
       rimeDataInstalled: $rimeDataInstalled, rimeConfigured: $rimeConfigured,
       message: $message}'
@@ -247,7 +267,6 @@ status_command() {
 require_ready_input() {
   fcitx_running || die "Fcitx5 is not running. Open the settings panel and run setup."
   rime_addon_present || die "Fcitx5 Rime is not installed. Open the settings panel and run setup."
-  rime_data_present || die "Rime Ice is not installed. Open the settings panel and run setup."
   group_has_rime || die "Rime is not configured. Open the settings panel and run setup."
 }
 
@@ -255,9 +274,13 @@ apply_mode() {
   local language="$1"
   if [[ "$language" == cn ]]; then
     "$FCITX_REMOTE" -s rime >/dev/null
-    "$FCITX_REMOTE" -o >/dev/null
+    # Older Rime versions do not expose this optional API.
+    if rime_ascii_mode >/dev/null; then
+      "$BUSCTL" --user --timeout=2s call "$FCITX_SERVICE" /rime \
+        org.fcitx.Fcitx.Rime1 SetAsciiMode b false >/dev/null
+    fi
   else
-    "$FCITX_REMOTE" -c >/dev/null
+    "$FCITX_REMOTE" -s keyboard-us >/dev/null
   fi
 }
 
@@ -270,7 +293,7 @@ set_mode_command() {
 
 toggle_command() {
   require_ready_input
-  if [[ "$(fcitx_state)" == 2 && "$(current_input_method)" == rime ]]; then
+  if [[ "$(current_input_method)" == rime && "$(rime_ascii_mode || true)" != true ]]; then
     apply_mode en
   else
     apply_mode cn
